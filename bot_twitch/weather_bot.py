@@ -14,6 +14,7 @@ CHANNEL = "#surgefly"
 OWNER_LOGIN = CHANNEL.lstrip("#").lower()
 WEATHER_API_URL = "https://weather-bot-6-vxs1.onrender.com/weather?city={}"
 USER_LEVELS_FILE = "user_levels.json"
+HIGH_LEVEL_USERS_FILE = "high_level_users.json"
 
 BANNED_WORDS = {
     "zov": 600,
@@ -204,6 +205,7 @@ commands = {
 
 dynamic_commands = {}
 user_levels = {}
+high_level_users = []
 sock = None
 
 try:
@@ -218,29 +220,21 @@ try:
 except Exception:
     pass
 
+try:
+    with open(HIGH_LEVEL_USERS_FILE, "r", encoding="utf-8") as file:
+        high_level_users = json.load(file)
+except Exception:
+    pass
+
+
 def clean_response(text):
     if not isinstance(text, str):
         return None
     return RESPONSE_TAG_RE.sub("", text).strip()
 
 
-def get_response_options(text):
-    if not isinstance(text, str):
-        return None, False
-    wants_reply = bool(re.search(r"\s#reply#\s*$", text, re.IGNORECASE))
-    cleaned_text = RESPONSE_TAG_RE.sub("", text).strip()
-    return cleaned_text, wants_reply
-
-
 def extract_login(response_line):
     match = re.search(r":([a-zA-Z0-9_]+)![^ ]+ PRIVMSG", response_line)
-    if match:
-        return match.group(1)
-    return None
-
-
-def extract_message_id(response_line):
-    match = re.search(r"(?:^|;)id=([^; ]+)", response_line)
     if match:
         return match.group(1)
     return None
@@ -254,6 +248,11 @@ def save_dynamic():
 def save_user_levels():
     with open(USER_LEVELS_FILE, "w", encoding="utf-8") as file:
         json.dump(user_levels, file, ensure_ascii=False, indent=2)
+
+
+def save_high_level_users():
+    with open(HIGH_LEVEL_USERS_FILE, "w", encoding="utf-8") as file:
+        json.dump(high_level_users, file, ensure_ascii=False, indent=2)
 
 
 def connect():
@@ -274,19 +273,12 @@ def connect():
     print("Бот запущен!")
 
 
-def send(message, reply_parent_id=None, reply_user_login=None):
-    response, wants_reply = get_response_options(message)
+def send(message):
+    response = clean_response(message)
     if not response:
         return
 
-    if reply_user_login:
-        response = response.replace("%user%", f"@{normalize_login(reply_user_login)}")
-
-    prefix = ""
-    if wants_reply and reply_parent_id:
-        prefix = f"@reply-parent-msg-id={reply_parent_id} "
-
-    payload = f"{prefix}PRIVMSG {CHANNEL} :{response}\r\n".encode("utf-8")
+    payload = f"PRIVMSG {CHANNEL} :{response}\r\n".encode("utf-8")
     try:
         sock.sendall(payload)
     except OSError:
@@ -302,18 +294,17 @@ def get_response(command_name):
     return None
 
 
-def get_dynamic_response(command_name):
-    if command_name in dynamic_commands:
-        return clean_response(dynamic_commands[command_name])
-    return None
-
-
 def normalize_login(login):
     return login.lstrip("@").strip().lower()
 
+
+def is_high_level_user(user_login):
+    return normalize_login(user_login) in {normalize_login(login) for login in high_level_users}
+
+
 def get_user_level(user_login, is_broadcaster):
     normalized_login = normalize_login(user_login)
-    if normalized_login == OWNER_LOGIN or is_broadcaster:
+    if normalized_login == OWNER_LOGIN or is_broadcaster or is_high_level_user(normalized_login):
         return 99
     return int(user_levels.get(normalized_login, 0))
 
@@ -326,13 +317,13 @@ def can_add_commands(level):
     return level >= 2
 
 
-def spam_command(command_name, count, reply_parent_id=None, reply_user_login=None):
+def spam_command(command_name, count):
     text = get_response(command_name)
     if not text:
         return
 
     for _ in range(min(count, 10)):
-        send(text, reply_parent_id=reply_parent_id, reply_user_login=reply_user_login)
+        send(text)
         time.sleep(0.2)
 
 
@@ -362,7 +353,6 @@ def handle_privmsg(response_line):
     user_match = re.search(r"display-name=([^; ]+)", tags)
     user_name = user_match.group(1) if user_match else "User"
     user_login = extract_login(response_line) or user_name
-    message_id = extract_message_id(response_line)
     user_level = get_user_level(user_login, is_broadcaster)
 
     try:
@@ -391,12 +381,12 @@ def handle_privmsg(response_line):
             new_level = int(parts[1])
             target_login = normalize_login(parts[2])
 
-            if new_level not in (0, 1, 2, 99):
-                send(f"{user_login} доступные уровни: 0, 1, 2, 99")
+            if new_level not in (0, 1, 2):
+                send(f"@{user_login} доступные уровни: 0, 1, 2")
                 return
 
             if target_login == OWNER_LOGIN:
-                send(f"{user_login} владельцу уровень менять нельзя")
+                send(f"@{user_login} владельцу уровень менять нельзя")
                 return
 
             if new_level == 0:
@@ -405,16 +395,69 @@ def handle_privmsg(response_line):
                 user_levels[target_login] = new_level
 
             save_user_levels()
-            send(f"{user_login} уровень {new_level} выдан пользователю {target_login}")
+            send(f"{user_login} выдал пользователю @{target_login} {new_level} уровень  модерации")
+        return
+
+    if message_lower.startswith("!highlvl "):
+        if normalize_login(user_login) != OWNER_LOGIN:
+            return
+
+        parts = message_lower.split()
+        if len(parts) == 2:
+            target_login = normalize_login(parts[1])
+
+            if target_login == OWNER_LOGIN:
+                send(f"@{user_login} ты уже главный")
+                return
+
+            if target_login not in {normalize_login(login) for login in high_level_users}:
+                high_level_users.append(target_login)
+                save_high_level_users()
+
+            send(f"{user_login} выдал пользователю {target_login} уровень ГЛАВНЫЙ теперь у него полный доступ")
+        return
+
+    if message_lower.startswith("!unhighlvl "):
+        if normalize_login(user_login) != OWNER_LOGIN:
+            return
+
+        parts = message_lower.split()
+        if len(parts) == 2:
+            target_login = normalize_login(parts[1])
+            updated_high_levels = [login for login in high_level_users if normalize_login(login) != target_login]
+
+            if len(updated_high_levels) == len(high_level_users):
+                send(f"@{user_login} пользователь @{target_login} не найден в highlvl")
+                return
+
+            high_level_users.clear()
+            high_level_users.extend(updated_high_levels)
+            save_high_level_users()
+            send(f"@{user_login} пользователь @{target_login} удален из highlvl")
         return
 
     if message_lower == "!lvllist":
         if user_level < 99:
             return
 
-        level_entries = ["SURGeFly Разработчик"]
-        level_entries.extend(f"{login} {level} lvl" for login, level in sorted(user_levels.items()))
+        if not user_levels:
+            send(f"@{user_login} список lvl пуст")
+            return
+
+        level_entries = [f"@{login} {level} lvl" for login, level in sorted(user_levels.items())]
         send("Лист уровней модерации: " + ", ".join(level_entries))
+        return
+
+    if message_lower == "!highlvllist":
+        if user_level < 99:
+            return
+
+        normalized_high_levels = sorted({normalize_login(login) for login in high_level_users})
+        if not normalized_high_levels:
+            send(f"@{user_login} список highlvl пуст")
+            return
+
+        send("highlvl: " + ", ".join(f"@{login}" for login in normalized_high_levels))
         return
 
     if message_lower.startswith("!cmd add "):
@@ -426,28 +469,9 @@ def handle_privmsg(response_line):
             name = parts[2].lower()
             if not name.startswith("!"):
                 name = "!" + name
-            dynamic_commands[name] = parts[3].strip()
+            dynamic_commands[name] = clean_response(parts[3])
             save_dynamic()
-            send(f"{user_login} команда {name} добавлена")
-        return
-
-    if message_lower.startswith("!cmd del "):
-        if not can_add_commands(user_level):
-            return
-
-        parts = message_lower.split()
-        if len(parts) == 3:
-            name = parts[2]
-            if not name.startswith("!"):
-                name = "!" + name
-
-            if name not in dynamic_commands:
-                send(f"{user_login} команда {name} не найдена")
-                return
-
-            dynamic_commands.pop(name, None)
-            save_dynamic()
-            send(f"{user_login} команда {name} удалена")
+            send(f"@{user_login} команда {name} добавлена")
         return
 
     if message_lower.startswith("!спам "):
@@ -459,17 +483,12 @@ def handle_privmsg(response_line):
             cmd = parts[1]
             if not cmd.startswith("!"):
                 cmd = "!" + cmd
-            spam_command(cmd, int(parts[2]), reply_parent_id=message_id, reply_user_login=user_login)
-        return
-
-    dynamic_text = get_dynamic_response(command_name)
-    if dynamic_text:
-        send(dynamic_text, reply_parent_id=message_id, reply_user_login=user_login)
+            spam_command(cmd, int(parts[2]))
         return
 
     match = re.fullmatch(r"(!\S+?)(\d+)", command_name)
     if can_use_spam(user_level) and match:
-        spam_command(match.group(1), int(match.group(2)), reply_parent_id=message_id, reply_user_login=user_login)
+        spam_command(match.group(1), int(match.group(2)))
 
 
 # --- ЗАПУСК ---
